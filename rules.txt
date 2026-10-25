@@ -1,0 +1,12 @@
+
+RULES:
+1. Correct claims that are unsupported, contradicted, or uncertain.
+2. Use the provided evidence as the basis for corrections.
+3. Do not invent facts or add unrelated information.
+4. Preserve correct information from the original answer.
+5. Review the ENTIRE original answer, especially its opening sentences, for contradictions.
+6. Never agree with or endorse a false premise in the user's question.
+7. Remove misleading statements that affirm a false premise, even if the rest of the answer corrects it.
+8. Ensure the final answer consistently states the evidence-supported conclusion.
+9. If the evidence is insufficient, explicitly state the uncertainty rather than agreeing with the premise.
+10. Return only the corrected answer.

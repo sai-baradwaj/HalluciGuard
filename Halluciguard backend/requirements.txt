@@ -1,0 +1,59 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+pydantic==2.13.4
+python-dotenv==1.2.3
+pytest==9.1.1
+httpx==0.28.1
+psycopg[binary]
+redis
+
+# =========================
+# FastAPI Backend
+# =========================
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+httpx
+
+# =========================
+# LangChain / LangGraph
+# =========================
+langchain-ollama
+langgraph
+
+# =========================
+# NLP / Embeddings
+# =========================
+numpy
+pandas
+torch
+transformers
+sentence-transformers
+
+# =========================
+# M5 / LLM / Reranking
+# =========================
+FlagEmbedding
+
+# =========================
+# Web Search
+# =========================
+ddgs
+
+# =========================
+# Database
+# =========================
+psycopg[binary]
+
+# =========================
+# Redis Cache
+# =========================
+redis
+
+# =========================
+# Testing
+# =========================
+pytest
+
+logger

@@ -1,0 +1,812 @@
+import sys
+from pathlib import Path
+
+NLP_ROOT = Path(__file__).resolve().parent.parent / "halluguardNLP"
+
+if str(NLP_ROOT) not in sys.path:
+    sys.path.insert(0, str(NLP_ROOT))
+
+
+
+import json
+import operator
+import re
+from typing import Annotated, Literal, TypedDict
+from halluguardNLP.retrieval.retrieval_pipeline import RetrievalPipeline
+from langchain_ollama import ChatOllama
+from langgraph.graph import END, START, StateGraph
+
+from M5.claim_extractor import extract_claims
+from M5.evidence_search import search_claim, search_claims
+from M5.fact_verifier import verify_claim
+from M5.llm_model import generate_response
+from M5.reranker import rerank_claims
+from M5.repair_agent import repair_response
+from M5.citation_builder import build_citations
+
+
+Route = Literal["Simple", "Current", "RAG", "Research"]
+
+
+class HalluciGuardState(TypedDict, total=False):
+    query: str
+    query_analysis: dict
+    route: Route
+
+    retrieved_documents: list
+    reranked_documents: list
+
+    enhanced_prompt: str
+    generated_answer: str
+
+    evaluation: str
+    quality_pass: bool
+    quality_score: float
+    quality_metrics: dict   
+
+    claims: list
+    evidence: list
+    verification_results: list
+
+    repaired_answer: str
+    citations: list
+    cited_answer: str
+
+    iteration: int
+    repaired_history: Annotated[list[str], operator.add]
+    verification_attempted: bool
+
+
+# --------------------------------------------------
+# Models
+# --------------------------------------------------
+
+query_analyzer = ChatOllama(model="qwen3:8b")
+prompt_enhancer = ChatOllama(model="qwen3:8b")
+
+rag_pipeline = RetrievalPipeline(
+    embedding_directory=str(
+        NLP_ROOT / "outputs" / "embeddings"
+    )
+)
+
+# --------------------------------------------------
+# Analyzer
+# --------------------------------------------------
+
+def Analyzer(state: HalluciGuardState):
+    query = state["query"]
+
+    prompt = f"""
+You are the Query Analyzer for HalluciGuard.
+
+Analyze this user query:
+
+{query}
+
+Return ONLY valid JSON.
+
+{{
+    "intent": "...",
+    "domain": "...",
+    "complexity": "Simple/Moderate/Complex",
+    "route": "Simple/Current/RAG/Research"
+}}
+
+ROUTING RULES:
+
+1. route = "Current"
+   Use Current when the query requires recent, live,
+   latest, or time-sensitive information.
+
+2. route = "RAG"
+   Use RAG when the answer should primarily come from
+   the project's stored documents or knowledge base.
+
+3. route = "Research"
+   Use Research when the query requires multi-step
+   external investigation, multiple sources, comparison,
+   synthesis, or evidence gathering.
+
+4. route = "Simple"
+   Use Simple for straightforward questions that do not
+   require current information, project documents, or
+   external research.
+
+IMPORTANT:
+- Select EXACTLY ONE route.
+- Never return multiple routes.
+- If a query could fit more than one category, choose
+  according to this priority:
+
+  Current > RAG > Research > Simple
+
+Return ONLY the JSON object.
+"""
+
+    response = query_analyzer.invoke(prompt)
+    raw = response.content.strip()
+
+    try:
+        analysis = json.loads(raw)
+    except json.JSONDecodeError:
+        # Recover JSON if the local model surrounds it with markdown.
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                analysis = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                analysis = {}
+        else:
+            analysis = {}
+
+    route = analysis.get("route", "Simple")
+    if route not in {"Simple", "Current", "RAG", "Research"}:
+        route = "Simple"
+
+    analysis.setdefault("intent", "unknown")
+    analysis.setdefault("domain", "general")
+    analysis.setdefault("complexity", "Simple")
+    analysis["route"] = route
+
+    return {"query_analysis": analysis}
+
+
+# --------------------------------------------------
+# Router
+# --------------------------------------------------
+
+def Router(state: HalluciGuardState):
+    analysis = state["query_analysis"]
+    route = analysis.get("route", "Simple")
+
+    if route not in {"Simple", "Current", "RAG", "Research"}:
+        route = "Simple"
+
+    return {"route": route}
+
+
+# --------------------------------------------------
+# Route nodes
+# --------------------------------------------------
+
+def Simple(state: HalluciGuardState):
+    return {
+        "evidence": [],
+        "retrieved_documents": [],
+        "reranked_documents": [],
+    }
+
+
+def Current(state: HalluciGuardState):
+    query = state["query"]
+
+    evidence = search_claim(query, max_results=5)
+
+    return {
+        "evidence": evidence,
+        "retrieved_documents": evidence,
+        "reranked_documents": [],
+    }
+
+
+def RAG(state: HalluciGuardState):
+    query = state["query"]
+
+    results = rag_pipeline.retrieve(
+        query,
+        top_k=5
+    )
+
+    clean_results = []
+
+    for item in results:
+        item = dict(item)
+        item.pop("embedding", None)
+        clean_results.append(item)
+
+    return {
+        "retrieved_documents": clean_results,
+        "reranked_documents": clean_results,
+        "evidence": [],
+    }
+
+
+def Research(state: HalluciGuardState):
+    query = state["query"]
+
+    evidence_results = search_claims([query], max_results=5)
+    reranked_results = rerank_claims(evidence_results, top_k=3)
+
+    evidence = []
+    for item in reranked_results:
+        evidence.extend(item.get("evidence", []))
+
+    return {
+        "evidence": evidence,
+        "reranked_documents": reranked_results,
+        "retrieved_documents": evidence,
+    }
+
+
+# --------------------------------------------------
+# Prompt Enhancement
+# --------------------------------------------------
+
+def PromptEnhancement(state: HalluciGuardState):
+    query = state["query"]
+    evidence = state.get("evidence", [])
+    documents = state.get("retrieved_documents", [])
+
+    context = []
+    if evidence:
+        context.extend(evidence)
+    if documents:
+        context.extend(documents)
+
+    context_text = ""
+    for i, item in enumerate(context, start=1):
+        if isinstance(item, dict):
+            title = item.get("title", "")
+            snippet = item.get("snippet",item.get("content",item.get("chunk_text", "")))
+            url = item.get("url", "")
+
+            context_text += (
+                f"\nEvidence {i}:\n"
+                f"Title: {title}\n"
+                f"Source: {url}\n"
+                f"Content: {snippet}\n"
+            )
+        else:
+            context_text += f"\nEvidence {i}:\n{item}\n"
+
+    prompt = f"""
+You are the generation component of HalluciGuard.
+
+Answer the user's query using the available evidence.
+
+USER QUERY:
+{query}
+
+AVAILABLE EVIDENCE:
+{context_text if context_text else "No external evidence is available."}
+
+Instructions:
+1. Answer the user's question directly.
+2. Use the evidence when available.
+3. Do not invent unsupported facts.
+4. If evidence is insufficient, clearly indicate uncertainty.
+5. Keep the answer relevant and understandable.
+"""
+
+    # Keep the existing SDC-2.2.2 design: PromptEnhancement is an LLM node.
+    response = prompt_enhancer.invoke(prompt)
+
+    return {"enhanced_prompt": response.content.strip()}
+
+
+# --------------------------------------------------
+# Base LLM
+# --------------------------------------------------
+
+def BaseLLM(state: HalluciGuardState):
+    answer = generate_response(state["enhanced_prompt"])
+    return {"generated_answer": answer}
+
+
+# --------------------------------------------------
+# Quality Evaluation
+# --------------------------------------------------
+
+def QualityEvaluator(state: HalluciGuardState):
+    query = state["query"]
+    answer = state.get("generated_answer", "")
+    iteration = state.get("iteration", 0)
+
+    prompt = f"""Evaluate the answer to the query below.
+
+Query: {query}
+
+Answer: {answer}
+
+Score each category from 0 to 10.
+Use the answer's actual content. Do not assume unsupported claims are true.
+Return exactly these five lines, with numeric scores only:
+Relevance: <score>
+Completeness: <score>
+Factuality: <score>
+Clarity: <score>
+Confidence: <score>
+"""
+
+    evaluation = generate_response(
+        prompt,
+        max_new_tokens=300,
+        do_sample=False,
+    )
+
+    print("RAW QUALITY EVALUATION:", repr(evaluation))
+
+    scores = _parse_quality_scores(evaluation)
+
+    quality_score = (
+        sum(scores.values()) / len(scores)
+        if len(scores) == 5
+        else 0.0
+    )
+
+    quality_pass = (
+        len(scores) == 5 and quality_score >= 6
+    )
+
+    return {
+        "evaluation": evaluation,
+        "quality_pass": quality_pass,
+        "quality_score": quality_score,
+        "quality_metrics": scores,
+        "iteration": iteration,
+    }
+
+
+def _parse_quality_scores(evaluation: str):
+    scores = {}
+    patterns = {
+        "relevance": r"Relevance:\s*(\d+(?:\.\d+)?)",
+        "completeness": r"Completeness:\s*(\d+(?:\.\d+)?)",
+        "factuality": r"Factuality:\s*(\d+(?:\.\d+)?)",
+        "clarity": r"Clarity:\s*(\d+(?:\.\d+)?)",
+        "confidence": r"Confidence:\s*(\d+(?:\.\d+)?)",
+    }
+
+    for name, pattern in patterns.items():
+        match = re.search(pattern, evaluation, re.IGNORECASE)
+        if match:
+            score = float(match.group(1))
+            scores[name] = max(0.0, min(10.0, score))
+
+    return scores
+
+
+def QualityRouter(state: HalluciGuardState):
+
+    evaluation = state.get(
+        "evaluation",
+        ""
+    )
+
+    iteration = state.get(
+        "iteration",
+        0
+    )
+
+    verification_attempted = state.get(
+        "verification_attempted",
+        False
+    )
+
+    scores = _parse_quality_scores(
+        evaluation
+    )
+
+    average = (
+        sum(scores.values()) / len(scores)
+        if scores
+        else 0.0
+    )
+
+    # -----------------------------------------
+    # Quality passed
+    # -----------------------------------------
+
+    if average >= 6:
+
+        # Initial response was already good.
+        if not verification_attempted:
+            return "INITIAL_PASS"
+
+        # Response was repaired and then passed.
+        return "REPAIRED_PASS"
+
+    # -----------------------------------------
+    # Maximum repair iterations reached
+    # -----------------------------------------
+
+    if iteration >= 2:
+
+        if verification_attempted:
+            return "REPAIRED_PASS"
+
+        return "INITIAL_PASS"
+
+    # -----------------------------------------
+    # Quality failed
+    # -----------------------------------------
+
+    return "FAIL"
+
+# --------------------------------------------------
+# Claim Extraction
+# --------------------------------------------------
+
+def ClaimExtractorNode(state: HalluciGuardState):
+
+    claims = extract_claims(
+        state.get("generated_answer", "")
+    )
+
+    return {
+        "claims": claims,
+        "verification_attempted": True,
+    }
+
+# --------------------------------------------------
+# Evidence Search
+# --------------------------------------------------
+
+def EvidenceSearchNode(state: HalluciGuardState):
+    claims = state.get("claims", [])
+
+    if not claims:
+        return {"evidence": []}
+
+    evidence_results = search_claims(claims, max_results=5)
+    return {"evidence": evidence_results}
+
+
+# --------------------------------------------------
+# Reranker
+# --------------------------------------------------
+
+def RerankerNode(state: HalluciGuardState):
+    evidence_results = state.get("evidence", [])
+
+    if not evidence_results:
+        return {"reranked_documents": []}
+
+    reranked = rerank_claims(evidence_results, top_k=3)
+    return {"reranked_documents": reranked}
+
+
+# --------------------------------------------------
+# Fact Verification
+# --------------------------------------------------
+
+def FactVerifierNode(state: HalluciGuardState):
+    reranked = state.get("reranked_documents", [])
+    verification_results = []
+
+    for item in reranked:
+        claim = item.get("claim", "")
+        evidence = item.get("evidence", [])
+
+        result = verify_claim(claim, evidence)
+
+        verification_results.append(
+            {
+                "claim": claim,
+                "evidence": evidence,
+                "verification": result,
+            }
+        )
+
+    return {"verification_results": verification_results}
+
+
+# --------------------------------------------------
+# Repair Agent
+# --------------------------------------------------
+def RepairAgent(state: HalluciGuardState):
+
+    question = state["query"]
+
+    original_answer = state.get(
+        "generated_answer",
+        ""
+    )
+
+    verification_results = state.get(
+        "verification_results",
+        []
+    )
+
+    # Keep only claims that need correction.
+    failed_claims = [
+        item
+        for item in verification_results
+        if str(
+            item.get("verification", "")
+        ).upper() != "SUPPORTED"
+    ]
+
+    iteration = state.get("iteration", 0) + 1
+
+    # If nothing failed, keep the current answer.
+    if not failed_claims:
+        return {
+            "generated_answer": original_answer,
+            "repaired_answer": original_answer,
+            "iteration": iteration,
+        }
+
+    repaired_answer = repair_response(
+        question,
+        original_answer,
+        failed_claims,
+    )
+
+    return {
+        "repaired_answer": repaired_answer,
+        "generated_answer": repaired_answer,
+        "iteration": iteration,
+        "repaired_history": [repaired_answer],
+    }
+
+# --------------------------------------------------
+# Citation Builder
+# --------------------------------------------------
+def CitationBuilder(state: HalluciGuardState):
+    response = state.get("generated_answer", "")
+    verification_results = state.get("verification_results", [])
+
+    cited_response = build_citations(
+        response,
+        verification_results
+    )
+
+    citations = []
+    seen = set()
+
+    for item in verification_results:
+        if not isinstance(item, dict):
+            continue
+
+        evidence = item.get("evidence", [])
+
+        # Support a single evidence object as well as a list.
+        if isinstance(evidence, dict):
+            evidence = [evidence]
+
+        if not isinstance(evidence, list):
+            continue
+
+        
+        if str(item.get("verification", "")).strip().upper() != "SUPPORTED":
+            continue
+
+        for source in evidence:
+            _add_citation(citations, seen, source)
+
+
+    return {
+        "generated_answer": cited_response,
+        "cited_answer": cited_response,
+        "citations": citations,
+    }
+
+
+def _add_citation(citations, seen, evidence):
+    if not isinstance(evidence, dict):
+        return
+
+    title = str(evidence.get("title", "")).strip()
+    url = str(evidence.get("url", "")).strip()
+
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return
+    except (ValueError, TypeError):
+        return
+
+    # Normalize the URL for duplicate detection.
+    normalized_url = url.rstrip("/")
+    citation = f"{title} — {url}" if title else url
+
+    if normalized_url not in seen:
+        seen.add(normalized_url)
+        citations.append(citation)
+
+# --------------------------------------------------
+# Final
+# --------------------------------------------------
+
+def Final(state: HalluciGuardState):
+
+    return {
+        "generated_answer": state.get(
+            "generated_answer",
+            state.get(
+                "repaired_answer",
+                ""
+            ),
+        )
+    }
+
+# --------------------------------------------------
+# Graph construction
+# --------------------------------------------------
+
+graph = StateGraph(HalluciGuardState)
+
+graph.add_node("Analyzer", Analyzer)
+graph.add_node("Router", Router)
+graph.add_node("Simple", Simple)
+graph.add_node("Current", Current)
+graph.add_node("RAG", RAG)
+graph.add_node("Research", Research)
+graph.add_node("PromptEnhancement", PromptEnhancement)
+graph.add_node("BaseLLM", BaseLLM)
+graph.add_node("QualityEvaluator", QualityEvaluator)
+graph.add_node("ClaimExtractor", ClaimExtractorNode)
+graph.add_node("EvidenceSearch", EvidenceSearchNode)
+graph.add_node("Reranker", RerankerNode)
+graph.add_node("FactVerifier", FactVerifierNode)
+graph.add_node("RepairAgent", RepairAgent)
+graph.add_node("CitationBuilder", CitationBuilder)
+graph.add_node("Final", Final)
+
+graph.add_edge(START, "Analyzer")
+graph.add_edge("Analyzer", "Router")
+
+graph.add_conditional_edges(
+    "Router",
+    lambda state: state["route"],
+    {
+        "Simple": "Simple",
+        "Current": "Current",
+        "RAG": "RAG",
+        "Research": "Research",
+    },
+)
+
+graph.add_edge("Simple", "PromptEnhancement")
+graph.add_edge("Current", "PromptEnhancement")
+graph.add_edge("RAG", "PromptEnhancement")
+graph.add_edge("Research", "PromptEnhancement")
+
+graph.add_edge("PromptEnhancement", "BaseLLM")
+graph.add_edge("BaseLLM", "QualityEvaluator")
+
+
+graph.add_conditional_edges(
+    "QualityEvaluator",
+    QualityRouter,
+    {
+        "INITIAL_PASS": "ClaimExtractor",
+        "FAIL": "ClaimExtractor",
+        "REPAIRED_PASS": "CitationBuilder",
+    },
+)
+
+graph.add_edge("ClaimExtractor", "EvidenceSearch")
+graph.add_edge("EvidenceSearch", "Reranker")
+graph.add_edge("Reranker", "FactVerifier")
+graph.add_edge("FactVerifier", "RepairAgent")
+graph.add_edge("RepairAgent", "CitationBuilder")
+graph.add_edge("CitationBuilder", "Final")
+graph.add_edge("Final", END)
+
+app = graph.compile()
+
+
+# --------------------------------------------------
+# FastAPI integration
+# --------------------------------------------------
+
+def run_halluciguard(query: str):
+    result = app.invoke(
+        {
+            "query": query,
+            "iteration": 0,
+            "repaired_history": [],
+        }
+    )
+    
+    print("\n========== HALLUCIGUARD DEBUG ==========")
+    print("GRAPH STATE KEYS:", list(result.keys()))
+    print("RAW QUALITY EVALUATION:", repr(result.get("evaluation", "")))
+    print("QUALITY METRICS:", result.get("quality_metrics", {}))
+    print("EXTRACTED CLAIMS:", result.get("claims", []))
+    print("VERIFICATION RESULTS:", result.get("verification_results", []))
+    print("CITATIONS:", result.get("citations", []))
+    print("========================================\n")
+
+
+    evaluation = result.get("evaluation", "")
+    scores = _parse_quality_scores(evaluation)
+
+    
+    quality_score = (
+        sum(scores.values()) / len(scores)
+        if scores else 0.0
+    )
+    quality_pass = quality_score >= 6
+
+    verification_results = result.get("verification_results", [])
+    hallucination_score = _calculate_hallucination_score(
+        verification_results
+    )
+    verification_status = _verification_status(verification_results)
+
+    # Conservative heuristic: penalize uncertainty and contradictions.
+    # This is NOT a statistically calibrated probability.
+    quality_confidence = scores.get("confidence", 0.0) / 10.0
+    confidence = min(
+        quality_confidence,
+        1.0 - hallucination_score
+    )
+
+
+    return {
+        "answer": result.get("generated_answer", ""),
+
+        "verification_status": verification_status,
+
+        "confidence": round(
+            max(0.0, min(1.0, confidence)),
+            3
+        ),
+
+        "hallucination_score": round(
+            hallucination_score,
+            3
+        ),
+
+        "citations": result.get(
+            "citations",
+            []
+        ),
+
+        # REAL QUALITY INFORMATION
+        "quality_score": round(
+            quality_score,
+            2
+        ),
+
+        "quality_pass": quality_pass,
+
+        "quality_metrics": scores,
+    }
+
+def _calculate_hallucination_score(verification_results):
+    if not verification_results:
+        return 0.0
+
+    weights = {
+        "SUPPORTED": 0.0,
+        "UNCERTAIN": 0.5,
+        "CONTRADICTED": 1.0,
+    }
+
+    values = []
+    for item in verification_results:
+        status = str(item.get("verification", "UNCERTAIN")).upper()
+        values.append(weights.get(status, 0.5))
+
+    return sum(values) / len(values)
+
+
+def _verification_status(verification_results):
+    if not verification_results:
+        return "NOT_VERIFIED"
+
+    statuses = {
+        str(item.get("verification", "UNCERTAIN")).upper()
+        for item in verification_results
+    }
+
+    if "CONTRADICTED" in statuses:
+        return "CONTRADICTED"
+    if "UNCERTAIN" in statuses:
+        return "UNCERTAIN"
+    if statuses == {"SUPPORTED"}:
+        return "SUPPORTED"
+
+    return "UNCERTAIN"

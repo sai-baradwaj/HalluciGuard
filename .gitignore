@@ -1,0 +1,33 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node.js
+node_modules/
+dist/
+.vite/
+
+# Logs
+*.log
+logs/
+
+# Local databases and generated artifacts
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Halluciguard backend/halluguardNLP/outputs/chunked/
+Halluciguard backend/halluguardNLP/outputs/embeddings/
